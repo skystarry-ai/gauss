@@ -287,7 +287,7 @@ def main():
         print(f"Loading {args.input} ...")
         sd = load_file(args.input)
         keys = sorted(
-            [k for k, v in sd.items() if v.numel() >= 1000],
+            [k for k, v in sd.items()],
             key=lambda k: sd[k].numel(),
             reverse=True,
         )
