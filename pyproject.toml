@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "gauss-compress"
+version = "0.1.0"
+description = "Compress LLM weights using GMM + ANS"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "민성 Skystarry", email = "vmintf@gmail.com" },
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "torch",
+    "safetensors",
+    "constriction",
+]
+
+[project.urls]
+Repository = "https://github.com/skystarry-ai/gauss"
+"Bug Tracker" = "https://github.com/skystarry-ai/gauss/issues"
+
+[project.scripts]
+gauss = "gauss.gauss:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gauss*"]

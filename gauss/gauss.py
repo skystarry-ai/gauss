@@ -228,7 +228,7 @@ class GaussReader:
 # CLI: compress / decompress / info
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
     import argparse
     import time
     from multiprocessing import Pool, cpu_count
@@ -236,7 +236,7 @@ if __name__ == "__main__":
     import torch
     from safetensors.torch import load_file, save_file
 
-    from gmm_compress import (
+    from .gmm_compress import (
         RESID_BOUND,
         RESID_SCALE,
         assign_all,
@@ -391,3 +391,7 @@ if __name__ == "__main__":
 
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
