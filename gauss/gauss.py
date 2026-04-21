@@ -228,6 +228,65 @@ class GaussReader:
 # CLI: compress / decompress / info
 # ---------------------------------------------------------------------------
 
+def _worker_save(task):
+    """Compress one layer; return a result dict containing ic/rc arrays."""
+    import time
+    import traceback
+
+    import numpy as np
+
+    try:
+        from .gmm_compress import (
+            RESID_BOUND,
+            RESID_SCALE,
+            assign_all,
+            encode_indices,
+            encode_residuals,
+            fit_gmm_fast,
+        )
+    except ImportError:
+        from gmm_compress import (
+            RESID_BOUND,
+            RESID_SCALE,
+            assign_all,
+            encode_indices,
+            encode_residuals,
+            fit_gmm_fast,
+        )
+
+    key, data_np, K, max_iter, max_fit, _ = task
+    try:
+        data = data_np.astype(np.float64)
+        N = len(data)
+        t0 = time.perf_counter()
+        if N > max_fit:
+            fit_data = data[np.random.choice(N, max_fit, replace=False)]
+        else:
+            fit_data = data
+        pi, mu, sigma, n_iter = fit_gmm_fast(fit_data, K, max_iter)
+        asgn = assign_all(data, pi, mu, sigma)
+        mu_a = mu[asgn]
+        sigma_a = sigma[asgn]
+        resid_q = np.clip(
+            np.round((data - mu_a) * RESID_SCALE).astype(np.int32),
+            -RESID_BOUND,
+            RESID_BOUND,
+        )
+        ic = encode_indices(asgn, pi)
+        rc = encode_residuals(resid_q, sigma_a)
+        orig = N * 4
+        comp = (len(ic) + len(rc)) * 4 + K * 3 * 8
+        return {
+            "key": key, "pi": pi, "mu": mu, "sigma": sigma,
+            "ic": ic, "rc": rc, "K": K,
+            "orig": orig, "comp": comp,
+            "ratio": orig / comp, "n_iter": n_iter,
+            "t": time.perf_counter() - t0, "error": None,
+        }
+    except Exception:
+        return {"key": key, "error": traceback.format_exc()}
+
+
 def main():
     import argparse
     import time
@@ -287,7 +346,7 @@ def main():
         print(f"Loading {args.input} ...")
         sd = load_file(args.input)
         keys = sorted(
-            [k for k, v in sd.items()],
+            list(sd.keys()),
             key=lambda k: sd[k].numel(),
             reverse=True,
         )
@@ -304,42 +363,6 @@ def main():
             for k in keys
         ]
         print(f"Layers: {len(keys)}, K={args.K}, workers={n_workers}")
-
-        def _worker_save(task):
-            """Compress one layer; return a result dict containing ic/rc arrays."""
-            import traceback
-
-            key, data_np, K, max_iter, max_fit, _ = task
-            try:
-                data = data_np.astype(np.float64)
-                N = len(data)
-                t0 = time.perf_counter()
-                if N > max_fit:
-                    fit_data = data[np.random.choice(N, max_fit, replace=False)]
-                else:
-                    fit_data = data
-                pi, mu, sigma, n_iter = fit_gmm_fast(fit_data, K, max_iter)
-                asgn = assign_all(data, pi, mu, sigma)
-                mu_a = mu[asgn]
-                sigma_a = sigma[asgn]
-                resid_q = np.clip(
-                    np.round((data - mu_a) * RESID_SCALE).astype(np.int32),
-                    -RESID_BOUND,
-                    RESID_BOUND,
-                )
-                ic = encode_indices(asgn, pi)
-                rc = encode_residuals(resid_q, sigma_a)
-                orig = N * 4
-                comp = (len(ic) + len(rc)) * 4 + K * 3 * 8
-                return {
-                    "key": key, "pi": pi, "mu": mu, "sigma": sigma,
-                    "ic": ic, "rc": rc, "K": K,
-                    "orig": orig, "comp": comp,
-                    "ratio": orig / comp, "n_iter": n_iter,
-                    "t": time.perf_counter() - t0, "error": None,
-                }
-            except Exception:
-                return {"key": key, "error": traceback.format_exc()}
 
         shapes = {k: tuple(sd[k].shape) for k in keys}
         total_orig = total_comp = 0
