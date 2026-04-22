@@ -19,8 +19,10 @@ import constriction
 import numpy as np
 import torch
 
-RESID_SCALE = 1000   # quantization scale: float residual → integer
-RESID_BOUND = 32767  # symmetric clamp range for quantized residuals
+RESID_SCALE = 1000      # quantization scale: float residual → integer
+RESID_BOUND = 32767     # symmetric clamp range for quantized residuals
+SHARD_THRESHOLD = 5_000_000  # shard 2-D+ layers larger than this many elements
+SHARD_ROWS = 4096            # rows per shard when sharding is applied
 
 
 def fit_gmm_fast(

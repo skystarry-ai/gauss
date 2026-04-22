@@ -1,8 +1,10 @@
 """
 .gauss file format — GMM+ANS compressed weight storage and retrieval.
 
-Binary layout
--------------
+Two on-disk versions are supported:
+
+GAUSS001 (legacy, single-shard per layer)
+------------------------------------------
 magic[8]         b"GAUSS001"
 n_layers[4]      uint32 LE
 --- index section (per-layer metadata) ---
@@ -11,6 +13,23 @@ K[1], pi[K*8], mu[K*8], sigma[K*8],
 idx_words[4], resid_words[4]
 --- data section (layers in index order) ---
 idx_data[idx_words*4], resid_data[resid_words*4]
+
+GAUSS002 (current, supports multi-shard layers)
+------------------------------------------------
+magic[8]         b"GAUSS002"
+n_layers[4]      uint32 LE
+--- index section ---
+name_len[2], name[n], ndim[1], shape[ndim*4],
+n_shards[2], shard_rows[4],
+  repeated n_shards times:
+    K[1], pi[K*8], mu[K*8], sigma[K*8], idx_words[4], resid_words[4]
+--- data section ---
+  repeated n_layers × n_shards:
+    idx_data[idx_words*4], resid_data[resid_words*4]
+
+Large 2-D+ layers (> SHARD_THRESHOLD elements) are split row-wise into
+shards of SHARD_ROWS rows each; each shard is compressed independently so
+all CPU cores stay busy simultaneously.
 """
 
 import struct
@@ -19,7 +38,8 @@ from pathlib import Path
 import numpy as np
 
 MAGIC = b"GAUSS001"
-VERSION = 1
+MAGIC_V2 = b"GAUSS002"
+VERSION = 2
 
 
 class GaussWriter:
@@ -29,13 +49,16 @@ class GaussWriter:
     -------
     >>> w = GaussWriter("model.gauss")
     >>> w.add(key, shape, K, pi, mu, sigma, idx_compressed, resid_compressed)
+    >>> w.add_shards(key, shape, shard_rows, shards)
     >>> w.save()
     >>> print(w.summary())
     """
 
     def __init__(self, path: str):
         self.path = Path(path)
-        self._layers = []  # list of (key, shape, K, pi, mu, sigma, ic, rc)
+        # each entry: (key, shape, shard_rows, shards)
+        # shards: list of dicts {K, pi, mu, sigma, ic, rc}
+        self._layers = []
 
     def add(
         self,
@@ -48,7 +71,7 @@ class GaussWriter:
         ic: np.ndarray,
         rc: np.ndarray,
     ):
-        """Append a single compressed layer.
+        """Append a single non-sharded compressed layer.
 
         Parameters
         ----------
@@ -61,42 +84,72 @@ class GaussWriter:
         ic:    ANS-encoded component indices, uint32 array from constriction
         rc:    ANS-encoded quantized residuals, uint32 array from constriction
         """
-        self._layers.append((
-            key,
-            shape,
-            K,
-            np.asarray(pi, np.float64),
-            np.asarray(mu, np.float64),
-            np.asarray(sigma, np.float64),
-            np.asarray(ic, np.uint32),
-            np.asarray(rc, np.uint32),
-        ))
+        self.add_shards(key, shape, 0, [{
+            "K": K,
+            "pi": np.asarray(pi, np.float64),
+            "mu": np.asarray(mu, np.float64),
+            "sigma": np.asarray(sigma, np.float64),
+            "ic": np.asarray(ic, np.uint32),
+            "rc": np.asarray(rc, np.uint32),
+        }])
+
+    def add_shards(
+        self,
+        key: str,
+        shape: tuple,
+        shard_rows: int,
+        shards: list,
+    ):
+        """Append a (possibly multi-shard) compressed layer.
+
+        Parameters
+        ----------
+        key:        tensor name used as the lookup key
+        shape:      original tensor shape
+        shard_rows: rows per shard; 0 for non-sharded layers
+        shards:     list of dicts, each with keys K, pi, mu, sigma, ic, rc
+        """
+        normalized = []
+        for s in shards:
+            normalized.append({
+                "K": int(s["K"]),
+                "pi": np.asarray(s["pi"], np.float64),
+                "mu": np.asarray(s["mu"], np.float64),
+                "sigma": np.asarray(s["sigma"], np.float64),
+                "ic": np.asarray(s["ic"], np.uint32),
+                "rc": np.asarray(s["rc"], np.uint32),
+            })
+        self._layers.append((key, shape, int(shard_rows), normalized))
 
     def save(self) -> int:
         """Serialize all layers to disk and return the file size in bytes."""
         with open(self.path, "wb") as f:
             # header
-            f.write(MAGIC)
+            f.write(MAGIC_V2)
             f.write(struct.pack("<I", len(self._layers)))
 
             # index section: per-layer metadata
-            for key, shape, K, pi, mu, sigma, ic, rc in self._layers:
+            for key, shape, shard_rows, shards in self._layers:
                 nb = key.encode("utf-8")
                 f.write(struct.pack("<H", len(nb)))
                 f.write(nb)
                 f.write(struct.pack("<B", len(shape)))
                 for s in shape:
                     f.write(struct.pack("<I", s))
-                f.write(struct.pack("<B", K))
-                pi.tofile(f)
-                mu.tofile(f)
-                sigma.tofile(f)
-                f.write(struct.pack("<II", len(ic), len(rc)))
+                f.write(struct.pack("<HI", len(shards), shard_rows))
+                for sh in shards:
+                    K = sh["K"]
+                    f.write(struct.pack("<B", K))
+                    sh["pi"].tofile(f)
+                    sh["mu"].tofile(f)
+                    sh["sigma"].tofile(f)
+                    f.write(struct.pack("<II", len(sh["ic"]), len(sh["rc"])))
 
             # data section: compressed payloads in index order
-            for _, _, _, _, _, _, ic, rc in self._layers:
-                ic.tofile(f)
-                rc.tofile(f)
+            for _, _, _, shards in self._layers:
+                for sh in shards:
+                    sh["ic"].tofile(f)
+                    sh["rc"].tofile(f)
 
         return self.path.stat().st_size
 
@@ -104,8 +157,10 @@ class GaussWriter:
         """Return a human-readable compression summary string."""
         total_orig = sum(int(np.prod(s)) * 4 for _, s, *_ in self._layers)
         total_comp = self.path.stat().st_size
+        n_sharded = sum(1 for _, _, _, shards in self._layers if len(shards) > 1)
+        shard_note = f", {n_sharded} sharded" if n_sharded else ""
         return (
-            f"{len(self._layers)} layers | "
+            f"{len(self._layers)} layers{shard_note} | "
             f"original {total_orig / 1024 / 1024:.1f} MB → "
             f"compressed {total_comp / 1024 / 1024:.1f} MB | "
             f"ratio {total_orig / total_comp:.3f}x"
@@ -114,6 +169,8 @@ class GaussWriter:
 
 class GaussReader:
     """Read and decompress layers from a .gauss file.
+
+    Supports both GAUSS001 (legacy) and GAUSS002 (sharded) formats.
 
     Example
     -------
@@ -133,7 +190,11 @@ class GaussReader:
         """Parse the index section from the file header into ``self._index``."""
         with open(self.path, "rb") as f:
             magic = f.read(8)
-            if magic != MAGIC:
+            if magic == MAGIC:
+                version = 1
+            elif magic == MAGIC_V2:
+                version = 2
+            else:
                 raise ValueError(f"Invalid .gauss file: magic={magic!r}")
             n = struct.unpack("<I", f.read(4))[0]
 
@@ -144,20 +205,38 @@ class GaussReader:
                 shape = tuple(
                     struct.unpack("<I", f.read(4))[0] for _ in range(ndim)
                 )
-                K = struct.unpack("<B", f.read(1))[0]
-                pi = np.frombuffer(f.read(K * 8), np.float64).copy()
-                mu = np.frombuffer(f.read(K * 8), np.float64).copy()
-                sigma = np.frombuffer(f.read(K * 8), np.float64).copy()
-                ic_words, rc_words = struct.unpack("<II", f.read(8))
+
+                if version == 1:
+                    # legacy single-shard layout
+                    K = struct.unpack("<B", f.read(1))[0]
+                    pi = np.frombuffer(f.read(K * 8), np.float64).copy()
+                    mu = np.frombuffer(f.read(K * 8), np.float64).copy()
+                    sigma = np.frombuffer(f.read(K * 8), np.float64).copy()
+                    ic_words, rc_words = struct.unpack("<II", f.read(8))
+                    shards = [dict(
+                        K=K, pi=pi, mu=mu, sigma=sigma,
+                        ic_words=ic_words, rc_words=rc_words,
+                    )]
+                    shard_rows = 0
+                else:
+                    n_shards, shard_rows = struct.unpack("<HI", f.read(6))
+                    shards = []
+                    for _ in range(n_shards):
+                        K = struct.unpack("<B", f.read(1))[0]
+                        pi = np.frombuffer(f.read(K * 8), np.float64).copy()
+                        mu = np.frombuffer(f.read(K * 8), np.float64).copy()
+                        sigma = np.frombuffer(f.read(K * 8), np.float64).copy()
+                        ic_words, rc_words = struct.unpack("<II", f.read(8))
+                        shards.append(dict(
+                            K=K, pi=pi, mu=mu, sigma=sigma,
+                            ic_words=ic_words, rc_words=rc_words,
+                        ))
+
                 self._index.append(dict(
                     key=key,
                     shape=shape,
-                    K=K,
-                    pi=pi,
-                    mu=mu,
-                    sigma=sigma,
-                    ic_words=ic_words,
-                    rc_words=rc_words,
+                    shard_rows=shard_rows,
+                    shards=shards,
                 ))
 
             self._data_offset = f.tell()
@@ -172,7 +251,8 @@ class GaussReader:
     def decompress(self, key: str) -> np.ndarray:
         """Decompress a single layer and return a float32 numpy array.
 
-        The returned array has the same shape as the original tensor.
+        For sharded layers all shards are decoded and concatenated before
+        reshaping to the original tensor shape.
         """
         import constriction
 
@@ -185,39 +265,60 @@ class GaussReader:
         if e is None:
             raise KeyError(key)
 
-        # compute byte offset for this layer within the data section
+        # compute byte offset for this layer's data block
         offset = self._data_offset
         for x in self._index:
             if x["key"] == key:
                 break
-            offset += (x["ic_words"] + x["rc_words"]) * 4
+            for sh in x["shards"]:
+                offset += (sh["ic_words"] + sh["rc_words"]) * 4
 
+        shape = e["shape"]
+        shard_rows = e["shard_rows"]
+        shards = e["shards"]
+        n_shards = len(shards)
+        total_elements = int(np.prod(shape))
+
+        # compute per-shard element count
+        if n_shards == 1:
+            shard_n_elements = [total_elements]
+        else:
+            row_size = int(np.prod(shape[1:]))
+            shard_n_elements = [shard_rows * row_size] * (n_shards - 1)
+            shard_n_elements.append(
+                total_elements - (n_shards - 1) * shard_rows * row_size
+            )
+
+        all_weights = []
         with open(self.path, "rb") as f:
             f.seek(offset)
-            ic = np.frombuffer(f.read(e["ic_words"] * 4), np.uint32).copy()
-            rc = np.frombuffer(f.read(e["rc_words"] * 4), np.uint32).copy()
+            for sh, N in zip(shards, shard_n_elements):
+                ic = np.frombuffer(f.read(sh["ic_words"] * 4), np.uint32).copy()
+                rc = np.frombuffer(f.read(sh["rc_words"] * 4), np.uint32).copy()
 
-        N = int(np.prod(e["shape"]))
-        pi, mu, sigma = e["pi"], e["mu"], e["sigma"]
+                pi, mu, sigma = sh["pi"], sh["mu"], sh["sigma"]
 
-        # decode component assignments
-        probs = (pi / pi.sum()).astype(np.float32)
-        model = constriction.stream.model.Categorical(probs, perfect=False)
-        ans = constriction.stream.stack.AnsCoder(ic)
-        asgn = ans.decode(model, N)
+                probs = (pi / pi.sum()).astype(np.float32)
+                model = constriction.stream.model.Categorical(
+                    probs, perfect=False
+                )
+                ans = constriction.stream.stack.AnsCoder(ic)
+                asgn = ans.decode(model, N)
 
-        # decode quantized residuals
-        sigma_a = sigma[asgn]
-        means = np.zeros(N, np.float64)
-        stds = np.maximum(sigma_a * RESID_SCALE, 0.5)
-        model_g = constriction.stream.model.QuantizedGaussian(
-            -RESID_BOUND, RESID_BOUND
-        )
-        ans2 = constriction.stream.stack.AnsCoder(rc)
-        resid_q = ans2.decode(model_g, means, stds)
+                sigma_a = sigma[asgn]
+                means = np.zeros(N, np.float64)
+                stds = np.maximum(sigma_a * RESID_SCALE, 0.5)
+                model_g = constriction.stream.model.QuantizedGaussian(
+                    -RESID_BOUND, RESID_BOUND
+                )
+                ans2 = constriction.stream.stack.AnsCoder(rc)
+                resid_q = ans2.decode(model_g, means, stds)
 
-        weights = (mu[asgn] + resid_q / RESID_SCALE).astype(np.float32)
-        return weights.reshape(e["shape"])
+                all_weights.append(
+                    (mu[asgn] + resid_q / RESID_SCALE).astype(np.float32)
+                )
+
+        return np.concatenate(all_weights).reshape(shape)
 
     def decompress_all(self) -> dict:
         """Decompress all layers and return a ``{key: np.ndarray}`` dict."""
@@ -229,7 +330,10 @@ class GaussReader:
 # ---------------------------------------------------------------------------
 
 def _worker_save(task):
-    """Compress one layer; return a result dict containing ic/rc arrays."""
+    """Compress a single layer or row-shard; return a result dict.
+
+    task = (key, shard_idx, n_shards, data_np, K, max_iter, max_fit)
+    """
     import time
     import traceback
 
@@ -254,7 +358,7 @@ def _worker_save(task):
             fit_gmm_fast,
         )
 
-    key, data_np, K, max_iter, max_fit, _ = task
+    key, shard_idx, n_shards, data_np, K, max_iter, max_fit = task
     try:
         data = data_np.astype(np.float64)
         N = len(data)
@@ -277,32 +381,33 @@ def _worker_save(task):
         orig = N * 4
         comp = (len(ic) + len(rc)) * 4 + K * 3 * 8
         return {
-            "key": key, "pi": pi, "mu": mu, "sigma": sigma,
+            "key": key, "shard_idx": shard_idx, "n_shards": n_shards,
+            "pi": pi, "mu": mu, "sigma": sigma,
             "ic": ic, "rc": rc, "K": K,
             "orig": orig, "comp": comp,
             "ratio": orig / comp, "n_iter": n_iter,
             "t": time.perf_counter() - t0, "error": None,
         }
     except Exception:
-        return {"key": key, "error": traceback.format_exc()}
+        return {
+            "key": key, "shard_idx": shard_idx, "n_shards": n_shards,
+            "error": traceback.format_exc(),
+        }
 
 
 def main():
     import argparse
+    import math
     import time
     from multiprocessing import Pool, cpu_count
 
     import torch
     from safetensors.torch import load_file, save_file
 
-    from .gmm_compress import (
-        RESID_BOUND,
-        RESID_SCALE,
-        assign_all,
-        encode_indices,
-        encode_residuals,
-        fit_gmm_fast,
-    )
+    try:
+        from .gmm_compress import SHARD_ROWS, SHARD_THRESHOLD
+    except ImportError:
+        from gmm_compress import SHARD_ROWS, SHARD_THRESHOLD
 
     parser = argparse.ArgumentParser(
         description="Gauss — GMM+ANS weight compression CLI"
@@ -316,6 +421,17 @@ def main():
     p_c.add_argument("--K", type=int, default=16)
     p_c.add_argument("--max-iter", type=int, default=100)
     p_c.add_argument("--workers", type=int, default=None)
+    p_c.add_argument(
+        "--shard-threshold", type=int, default=SHARD_THRESHOLD,
+        help=(
+            "shard 2-D+ layers with more elements than this "
+            f"(default: {SHARD_THRESHOLD:,})"
+        ),
+    )
+    p_c.add_argument(
+        "--shard-rows", type=int, default=SHARD_ROWS,
+        help=f"rows per shard for large layers (default: {SHARD_ROWS})",
+    )
 
     # decompress subcommand
     p_d = sub.add_parser("decompress", help=".gauss → .safetensors")
@@ -336,57 +452,120 @@ def main():
         print(f"Layers: {len(r)}")
         for e in r._index:
             n = int(np.prod(e["shape"]))
-            comp = (e["ic_words"] + e["rc_words"]) * 4
+            comp = sum(
+                s["ic_words"] + s["rc_words"] for s in e["shards"]
+            ) * 4
+            n_shards = len(e["shards"])
+            shard_tag = f" [×{n_shards} shards]" if n_shards > 1 else ""
+            K = e["shards"][0]["K"]
             print(
                 f"  {e['key']:<50}  {n * 4 // 1024:>6}KB → "
-                f"{comp // 1024:>5}KB  {n * 4 / comp:.3f}x  K={e['K']}"
+                f"{comp // 1024:>5}KB  {n * 4 / comp:.3f}x"
+                f"  K={K}{shard_tag}"
             )
 
     elif args.cmd == "compress":
         print(f"Loading {args.input} ...")
         sd = load_file(args.input)
-        keys = sorted(
-            list(sd.keys()),
-            key=lambda k: sd[k].numel(),
-            reverse=True,
-        )
-        n_workers = args.workers or cpu_count()
-        tasks = [
-            (
-                k,
-                sd[k].float().numpy().flatten(),
-                args.K,
-                args.max_iter,
-                200_000,
-                False,
-            )
-            for k in keys
-        ]
-        print(f"Layers: {len(keys)}, K={args.K}, workers={n_workers}")
 
+        # sort largest-first for better initial load balancing
+        keys = sorted(sd.keys(), key=lambda k: sd[k].numel(), reverse=True)
+
+        n_workers = args.workers or cpu_count()
+        shard_threshold = args.shard_threshold
+        shard_rows = args.shard_rows
+
+        # build task list; large 2-D+ layers are split into row-wise shards
+        tasks = []
         shapes = {k: tuple(sd[k].shape) for k in keys}
-        total_orig = total_comp = 0
+        layer_shard_info = {}  # key -> (n_shards, actual_shard_rows)
+
+        for k in keys:
+            t = sd[k]
+            flat = t.float().numpy().flatten()
+            numel = t.numel()
+
+            if numel > shard_threshold and t.ndim >= 2:
+                n_rows = t.shape[0]
+                # cap shard_rows so we always have at least one row per shard
+                actual_sr = min(shard_rows, n_rows)
+                n_shards = math.ceil(n_rows / actual_sr)
+                row_size = numel // n_rows
+                layer_shard_info[k] = (n_shards, actual_sr)
+                for i in range(n_shards):
+                    start = i * actual_sr * row_size
+                    end = min(start + actual_sr * row_size, numel)
+                    tasks.append((
+                        k, i, n_shards,
+                        flat[start:end],
+                        args.K, args.max_iter, 200_000,
+                    ))
+            else:
+                layer_shard_info[k] = (1, 0)
+                tasks.append((k, 0, 1, flat, args.K, args.max_iter, 200_000))
+
+        n_sharded_layers = sum(
+            1 for v in layer_shard_info.values() if v[0] > 1
+        )
+        print(
+            f"Layers: {len(keys)} ({n_sharded_layers} sharded) | "
+            f"tasks: {len(tasks)} | K={args.K} | workers={n_workers}"
+        )
+
+        # pending[key] collects per-shard results; entry removed once complete
+        pending = {
+            k: [None] * info[0] for k, info in layer_shard_info.items()
+        }
         writer = GaussWriter(args.output)
+        total_orig = total_comp = 0
+        completed = []
         t0 = time.perf_counter()
 
         with Pool(n_workers) as pool:
-            for i, res in enumerate(
-                pool.imap_unordered(_worker_save, tasks), 1
-            ):
-                if res["error"]:
-                    print(f"  ERROR [{res['key']}]")
+            for res in pool.imap_unordered(_worker_save, tasks):
+                if res.get("error"):
+                    print(
+                        f"  ERROR [{res['key']} shard {res.get('shard_idx', 0)}]"
+                        f"\n{res['error'][:200]}"
+                    )
                     continue
-                writer.add(
-                    res["key"], shapes[res["key"]], res["K"],
-                    res["pi"], res["mu"], res["sigma"],
-                    res["ic"], res["rc"],
+
+                key = res["key"]
+                pending[key][res["shard_idx"]] = res
+
+                # flush to writer only when every shard of the layer is ready
+                if any(s is None for s in pending[key]):
+                    continue
+
+                shard_results = pending.pop(key)
+                n_sh = len(shard_results)
+                orig_sum = sum(s["orig"] for s in shard_results)
+                comp_sum = sum(s["comp"] for s in shard_results)
+                total_orig += orig_sum
+                total_comp += comp_sum
+
+                writer.add_shards(
+                    key,
+                    shapes[key],
+                    layer_shard_info[key][1],
+                    [
+                        {
+                            "K": s["K"], "pi": s["pi"], "mu": s["mu"],
+                            "sigma": s["sigma"], "ic": s["ic"], "rc": s["rc"],
+                        }
+                        for s in shard_results
+                    ],
                 )
-                total_orig += res["orig"]
-                total_comp += res["comp"]
+                completed.append(key)
+
+                shard_tag = f" [{n_sh} shards]" if n_sh > 1 else ""
+                # report slowest shard wall-time (shards run in parallel)
+                elapsed_str = f"{max(s['t'] for s in shard_results):.1f}s"
                 print(
-                    f"  [{i:4d}/{len(tasks)}] {res['key']:<48}"
-                    f"  {res['ratio']:.3f}x  iter={res['n_iter']:3d}"
-                    f"  {res['t']:.1f}s"
+                    f"  [{len(completed):4d}/{len(keys)}] {key:<46}"
+                    f"  {orig_sum / comp_sum:.3f}x"
+                    f"  iter={shard_results[0]['n_iter']:3d}"
+                    f"{shard_tag}  {elapsed_str}"
                 )
 
         saved = writer.save()
