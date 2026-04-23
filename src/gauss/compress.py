@@ -29,7 +29,7 @@ from .codec import (
 from .gmm import assign_all
 from .format import DTYPE_MAP, GaussReader, GaussWriter, _DTYPE_NUMPY
 
-__all__ = [
+__all__ =[
     "SHARD_THRESHOLD",
     "SHARD_ROWS",
     "RAW_THRESHOLD",
@@ -52,13 +52,13 @@ RAW_THRESHOLD: int = 32768
 # Multiprocessing worker — GMM compression
 # ---------------------------------------------------------------------------
 
-def _worker_compress(task):
+def _worker_compress(task: tuple) -> dict:
     """Compress one layer shard; designed to run inside a Pool worker.
 
     Parameters
     ----------
     task : tuple of
-        (key, shard_idx, n_shards, data_np, K, max_iter, max_fit_samples)
+        (key, shard_idx, n_shards, data_np, K, max_iter, max_fit_samples, dtype_str)
 
     Returns
     -------
@@ -130,7 +130,7 @@ def _worker_compress(task):
 # Multiprocessing worker — decompression
 # ---------------------------------------------------------------------------
 
-def _worker_decompress(args):
+def _worker_decompress(args: tuple) -> tuple:
     """Decompress one tensor from a .gauss file.
 
     Designed to run inside a ``multiprocessing.Pool``.
@@ -158,10 +158,10 @@ def _worker_decompress(args):
 
     if is_raw:
         # Compute byte offset in the raw data section.
-        # raw_data_offset already points to the start of the raw section;
-        # we need to know this entry's position within it, which is passed
-        # as raw_data_offset directly (pre-computed by the caller).
         np_dtype = _DTYPE_NUMPY[dtype_id]
+        if dtype_id == 2:  # bfloat16
+            np_dtype = np.int16
+
         with open(path, "rb") as f:
             f.seek(raw_data_offset)
             raw = f.read(entry["raw_n_bytes"])
@@ -182,12 +182,12 @@ def _worker_decompress(args):
         shard_n = [total_elements]
     else:
         row_size = int(np.prod(shape[1:]))
-        shard_n = [shard_rows * row_size] * (n_shards - 1)
+        shard_n =[shard_rows * row_size] * (n_shards - 1)
         shard_n.append(
             total_elements - (n_shards - 1) * shard_rows * row_size
         )
 
-    out_chunks = []
+    out_chunks =[]
     with open(path, "rb") as f:
         f.seek(data_offset)
         for sh, N in zip(shards, shard_n):
@@ -239,7 +239,7 @@ def compress_file(
     shard_rows: int = SHARD_ROWS,
     raw_threshold: int = RAW_THRESHOLD,
     layer_filter: list = None,
-):
+) -> dict:
     """Compress a .safetensors file to .gauss format.
 
     Parameters
@@ -277,7 +277,7 @@ def compress_file(
     keys.sort(key=lambda k: sd[k].numel(), reverse=True)
 
     # Separate raw (lossless) layers from compressed layers.
-    compress_keys = []
+    compress_keys =[]
     raw_keys = []
     for k in keys:
         t = sd[k]
@@ -331,7 +331,7 @@ def compress_file(
     }
     writer = GaussWriter(output_path)
     total_orig = total_comp = 0
-    completed = []
+    completed =[]
     t0 = time.perf_counter()
 
     with Pool(n_workers) as pool:
@@ -361,8 +361,7 @@ def compress_file(
                 key,
                 shapes[key],
                 dtype_ids[key],
-                layer_shard_info[key][1],
-                [
+                layer_shard_info[key][1],[
                     {
                         "K": s["K"], "pi": s["pi"], "mu": s["mu"],
                         "sigma": s["sigma"], "ic": s["ic"], "rc": s["rc"],
@@ -375,7 +374,7 @@ def compress_file(
             )
             completed.append(key)
 
-            shard_tag = f" [{n_sh} shards]" if n_sh > 1 else ""
+            shard_tag = f"[{n_sh} shards]" if n_sh > 1 else ""
             elapsed_str = f"{max(s['t'] for s in shard_results):.1f}s"
             print(
                 f"  [{len(completed):4d}/{len(compress_keys)}] {key:<46}"
@@ -388,9 +387,9 @@ def compress_file(
     for k in raw_keys:
         t = sd[k]
         dtype_id = DTYPE_MAP.get(str(t.dtype), 0)
-        # bfloat16 has no numpy equivalent — store as float32 bytes.
+        # Store exact raw bytes for bfloat16 via int16 view to prevent loss
         if t.dtype == torch.bfloat16:
-            arr = t.float().numpy()
+            arr = t.view(torch.int16).numpy()
         else:
             arr = t.numpy()
         raw_bytes = arr.tobytes()
@@ -424,7 +423,7 @@ def decompress_file(
     input_path: str,
     output_path: str,
     n_workers: int = None,
-):
+) -> dict:
     """Decompress a .gauss file back to .safetensors format.
 
     Each tensor is restored to its original dtype as recorded in the file.
@@ -449,7 +448,7 @@ def decompress_file(
     reader = GaussReader(input_path)
 
     # Pre-compute byte offsets so workers can seek directly.
-    tasks = []
+    tasks =[]
     offset = reader._data_offset
     for entry in reader._index:
         tasks.append((
@@ -487,7 +486,13 @@ def decompress_file(
             )
             torch_dtype_str = DTYPE_ID_MAP.get(dtype_id, "torch.float32")
             torch_dtype = getattr(torch, torch_dtype_str.replace("torch.", ""))
-            sd[key] = torch.from_numpy(arr).to(torch_dtype)
+
+            # View correctly preserved bytes as bfloat16
+            if torch_dtype == torch.bfloat16 and arr.dtype == np.int16:
+                sd[key] = torch.from_numpy(arr).view(torch.bfloat16)
+            else:
+                sd[key] = torch.from_numpy(arr).to(torch_dtype)
+                
             print(f"  [{i:4d}/{n_layers}] {key}")
 
     save_file(sd, output_path)
@@ -507,7 +512,7 @@ def decompress_file(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     """Entry point for the ``gauss`` command-line tool."""
     import argparse
 
@@ -566,7 +571,7 @@ def main():
     if args.cmd == "compress":
         layer_filter = None
         if args.layers:
-            layer_filter = [k.strip() for k in args.layers.split(",")]
+            layer_filter =[k.strip() for k in args.layers.split(",")]
         compress_file(
             args.input, args.output,
             K=args.K,
@@ -588,7 +593,7 @@ def main():
         parser.print_help()
 
 
-def _cmd_info(file_path: str):
+def _cmd_info(file_path: str) -> None:
     """Print per-layer metadata without decompressing anything."""
     reader = GaussReader(file_path)
     size = Path(file_path).stat().st_size
@@ -608,7 +613,7 @@ def _cmd_info(file_path: str):
             s["ic_words"] + s["rc_words"] for s in e["shards"]
         ) * 4
         n_shards = len(e["shards"])
-        shard_tag = f" [×{n_shards} shards]" if n_shards > 1 else ""
+        shard_tag = f"[×{n_shards} shards]" if n_shards > 1 else ""
         K = e["shards"][0]["K"]
         # resid_scale is uniform per layer in practice; show the first shard's.
         s_eff = e["shards"][0].get("resid_scale", RESID_SCALE)
