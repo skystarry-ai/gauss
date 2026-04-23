@@ -7,7 +7,7 @@ GAUSS001  Legacy single-shard, no raw section, no dtype field.
 GAUSS002  Multi-shard layers, no raw section, no dtype field.
 GAUSS003  Adds dtype field, raw section, raw_n_bytes.
 GAUSS004  Current format. Adds:
-            - resid_scale[2] (uint16 LE) per shard — effective quantization
+            - resid_scale[4] (uint32 LE) per shard — effective quantization
               scale used when encoding residuals.  Enables adaptive-S for
               reduced-precision dtypes (fp16, bf16).
 
@@ -30,7 +30,7 @@ shard_rows[4]     uint32
     pi[K*8]         float64 LE
     mu[K*8]         float64 LE
     sigma[K*8]      float64 LE
-    resid_scale[2]  uint16 LE  (NEW in v4; fp32 default = 1000)
+    resid_scale[4]  uint32 LE  (NEW in v4; fp32 default = 1000)
     idx_words[4]    uint32
     resid_words[4]  uint32
 
@@ -65,6 +65,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .codec import RESID_SCALE
+
 __all__ = ["GaussWriter", "GaussReader", "DTYPE_MAP", "DTYPE_ID_MAP"]
 
 MAGIC_V1 = b"GAUSS001"
@@ -92,7 +94,7 @@ DTYPE_ID_MAP: dict = {v: k for k, v in DTYPE_MAP.items()}
 _DTYPE_NUMPY: dict = {
     0: np.float32,
     1: np.float16,
-    2: np.float32,   # bfloat16 has no numpy equivalent; stored as fp32 bytes
+    2: np.float32,   # bfloat16 decompresses to float32 for GMM; raw handled as int16
     3: np.float64,
     4: np.int8,
     5: np.int16,
@@ -124,9 +126,9 @@ class GaussWriter:
     def __init__(self, path: str):
         self.path = Path(path)
         # Compressed entries: (key, shape, dtype_id, shard_rows, shards)
-        self._compressed: list = []
+        self._compressed: list =[]
         # Raw entries: (key, shape, dtype_id, raw_bytes)
-        self._raw: list = []
+        self._raw: list =[]
 
     # ------------------------------------------------------------------
     # Public API
@@ -143,7 +145,7 @@ class GaussWriter:
         ic: np.ndarray,
         rc: np.ndarray,
         dtype_id: int = 0,
-    ):
+    ) -> None:
         """Append a single non-sharded compressed layer (convenience wrapper).
 
         Parameters
@@ -159,8 +161,7 @@ class GaussWriter:
         dtype_id: Torch dtype id (see DTYPE_MAP); default 0 = float32.
         """
         self.add_shards(
-            key, shape, dtype_id, 0,
-            [{"K": K, "pi": pi, "mu": mu, "sigma": sigma, "ic": ic, "rc": rc}],
+            key, shape, dtype_id, 0,[{"K": K, "pi": pi, "mu": mu, "sigma": sigma, "ic": ic, "rc": rc}],
         )
 
     def add_shards(
@@ -170,7 +171,7 @@ class GaussWriter:
         dtype_id: int,
         shard_rows: int,
         shards: list,
-    ):
+    ) -> None:
         """Append a (possibly multi-shard) compressed layer.
 
         Parameters
@@ -189,6 +190,7 @@ class GaussWriter:
                 "sigma": np.asarray(s["sigma"], np.float64),
                 "ic": np.asarray(s["ic"], np.uint32),
                 "rc": np.asarray(s["rc"], np.uint32),
+                "resid_scale": s.get("resid_scale", RESID_SCALE),
             }
             for s in shards
         ]
@@ -201,7 +203,7 @@ class GaussWriter:
         shape: tuple,
         dtype_id: int,
         raw_bytes: bytes,
-    ):
+    ) -> None:
         """Store a tensor losslessly in the raw section.
 
         Intended for small tensors (numel < RAW_THRESHOLD) and 1-D tensors
@@ -237,8 +239,8 @@ class GaussWriter:
                     sh["pi"].tofile(f)
                     sh["mu"].tofile(f)
                     sh["sigma"].tofile(f)
-                    # v4: write resid_scale before word counts.
-                    f.write(struct.pack("<H", resid_scale))
+                    # v4: write resid_scale as uint32 to maintain 4-byte alignment
+                    f.write(struct.pack("<I", resid_scale))
                     f.write(struct.pack("<II",
                                        len(sh["ic"]), len(sh["rc"])))
 
@@ -266,7 +268,7 @@ class GaussWriter:
         # Estimate original size in bytes using the dtype byte-width.
         total_orig = 0
         for key, shape, dtype_id, shard_rows, shards in self._compressed:
-            dtype_bytes = np.dtype(_DTYPE_NUMPY[dtype_id]).itemsize
+            dtype_bytes = 2 if dtype_id == 2 else np.dtype(_DTYPE_NUMPY[dtype_id]).itemsize
             total_orig += int(np.prod(shape)) * dtype_bytes
         for key, shape, dtype_id, raw_bytes in self._raw:
             total_orig += len(raw_bytes)
@@ -303,9 +305,9 @@ class GaussReader:
     def __init__(self, path: str):
         self.path = Path(path)
         # Compressed entries parsed from the index section.
-        self._index: list = []
+        self._index: list =[]
         # Raw entries parsed from the raw index section.
-        self._raw_index: list = []
+        self._raw_index: list =[]
         self._data_offset: int = 0
         self._raw_data_offset: int = 0
         self._version: int = 0
@@ -358,7 +360,7 @@ class GaussReader:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _parse_index(self):
+    def _parse_index(self) -> None:
         """Parse the index section(s) from the file header."""
         with open(self.path, "rb") as f:
             magic = f.read(8)
@@ -393,7 +395,7 @@ class GaussReader:
                     mu = _read_f64(f, K)
                     sigma = _read_f64(f, K)
                     ic_words, rc_words = struct.unpack("<II", f.read(8))
-                    shards = [dict(K=K, pi=pi, mu=mu, sigma=sigma,
+                    shards =[dict(K=K, pi=pi, mu=mu, sigma=sigma,
                                    ic_words=ic_words, rc_words=rc_words,
                                    resid_scale=RESID_SCALE)]
                     shard_rows = 0
@@ -460,12 +462,12 @@ class GaussReader:
             shard_n = [total_elements]
         else:
             row_size = int(np.prod(shape[1:]))
-            shard_n = [shard_rows * row_size] * (n_shards - 1)
+            shard_n =[shard_rows * row_size] * (n_shards - 1)
             shard_n.append(
                 total_elements - (n_shards - 1) * shard_rows * row_size
             )
 
-        out_chunks = []
+        out_chunks =[]
         with open(self.path, "rb") as f:
             f.seek(offset)
             for sh, N in zip(shards, shard_n):
@@ -520,6 +522,9 @@ class GaussReader:
             raw = f.read(entry["raw_n_bytes"])
 
         np_dtype = _DTYPE_NUMPY[dtype_id]
+        if dtype_id == 2:  # Treat bfloat16 bytes safely as int16
+            np_dtype = np.int16
+
         return np.frombuffer(raw, dtype=np_dtype).copy().reshape(shape)
 
 
@@ -527,13 +532,13 @@ class GaussReader:
 # Private I/O helpers
 # ---------------------------------------------------------------------------
 
-def _write_name(f, name: str):
+def _write_name(f, name: str) -> None:
     nb = name.encode("utf-8")
     f.write(struct.pack("<H", len(nb)))
     f.write(nb)
 
 
-def _write_shape(f, shape: tuple):
+def _write_shape(f, shape: tuple) -> None:
     f.write(struct.pack("<B", len(shape)))
     for s in shape:
         f.write(struct.pack("<I", s))
@@ -560,21 +565,22 @@ def _read_shards(f, n_shards: int, read_resid_scale: bool = False) -> list:
     ----------
     f:                Open file positioned at the first shard descriptor.
     n_shards:         Number of shards to read.
-    read_resid_scale: True for GAUSS004+ files which store a uint16
+    read_resid_scale: True for GAUSS004+ files which store a uint32
                       resid_scale field after the GMM parameters.
                       False for GAUSS001–003 (legacy); scale defaults to
                       RESID_SCALE (1000).
     """
     from .codec import RESID_SCALE as _DEFAULT_SCALE
 
-    shards = []
+    shards =[]
     for _ in range(n_shards):
         K = struct.unpack("<B", f.read(1))[0]
         pi = _read_f64(f, K)
         mu = _read_f64(f, K)
         sigma = _read_f64(f, K)
         if read_resid_scale:
-            (resid_scale,) = struct.unpack("<H", f.read(2))
+            # Unpack as uint32 (<I) to maintain 4-byte alignment
+            (resid_scale,) = struct.unpack("<I", f.read(4))
         else:
             resid_scale = _DEFAULT_SCALE
         ic_words, rc_words = struct.unpack("<II", f.read(8))
