@@ -65,6 +65,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .codec import RESID_SCALE
+
 __all__ = ["GaussWriter", "GaussReader", "DTYPE_MAP", "DTYPE_ID_MAP"]
 
 MAGIC_V1 = b"GAUSS001"
