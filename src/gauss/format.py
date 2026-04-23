@@ -5,14 +5,15 @@ Format versions
 ---------------
 GAUSS001  Legacy single-shard, no raw section, no dtype field.
 GAUSS002  Multi-shard layers, no raw section, no dtype field.
-GAUSS003  Current format. Adds:
-            - dtype field per layer (uint8 torch dtype id, see DTYPE_MAP)
-            - raw section for small / 1-D tensors stored losslessly
-            - raw_n_bytes field in the index section for raw entries
+GAUSS003  Adds dtype field, raw section, raw_n_bytes.
+GAUSS004  Current format. Adds:
+            - resid_scale[2] (uint16 LE) per shard — effective quantization
+              scale used when encoding residuals.  Enables adaptive-S for
+              reduced-precision dtypes (fp16, bf16).
 
-On-disk layout (GAUSS003)
+On-disk layout (GAUSS004)
 --------------------------
-magic[8]          b"GAUSS003"
+magic[8]          b"GAUSS004"
 n_compressed[4]   uint32 LE — number of GMM-compressed layers
 n_raw[4]          uint32 LE — number of raw (lossless) layers
 
@@ -29,6 +30,7 @@ shard_rows[4]     uint32
     pi[K*8]         float64 LE
     mu[K*8]         float64 LE
     sigma[K*8]      float64 LE
+    resid_scale[2]  uint16 LE  (NEW in v4; fp32 default = 1000)
     idx_words[4]    uint32
     resid_words[4]  uint32
 
@@ -51,6 +53,11 @@ Random access
 All idx_words / resid_words / raw_n_bytes are in the index section, so the
 byte offset of any tensor can be computed with a linear scan and a single
 seek — no need to read the entire data section.
+
+Backward compatibility
+----------------------
+GAUSS001–003 files are still readable; missing resid_scale fields default
+to RESID_SCALE (1000) for lossless decompression of legacy files.
 """
 
 import struct
@@ -63,6 +70,7 @@ __all__ = ["GaussWriter", "GaussReader", "DTYPE_MAP", "DTYPE_ID_MAP"]
 MAGIC_V1 = b"GAUSS001"
 MAGIC_V2 = b"GAUSS002"
 MAGIC_V3 = b"GAUSS003"
+MAGIC_V4 = b"GAUSS004"
 
 # Mapping from torch dtype string → uint8 id stored in the file.
 # torch.float32 is the historical default and maps to id 0.
@@ -211,8 +219,8 @@ class GaussWriter:
     def save(self) -> int:
         """Serialize all layers to disk and return the file size in bytes."""
         with open(self.path, "wb") as f:
-            # File header.
-            f.write(MAGIC_V3)
+            # File header (GAUSS004).
+            f.write(MAGIC_V4)
             f.write(struct.pack("<II", len(self._compressed), len(self._raw)))
 
             # Compressed index section.
@@ -223,10 +231,14 @@ class GaussWriter:
                 f.write(struct.pack("<HI", len(shards), shard_rows))
                 for sh in shards:
                     K = sh["K"]
+                    # resid_scale defaults to RESID_SCALE for fp32 shards.
+                    resid_scale = int(sh.get("resid_scale", RESID_SCALE))
                     f.write(struct.pack("<B", K))
                     sh["pi"].tofile(f)
                     sh["mu"].tofile(f)
                     sh["sigma"].tofile(f)
+                    # v4: write resid_scale before word counts.
+                    f.write(struct.pack("<H", resid_scale))
                     f.write(struct.pack("<II",
                                        len(sh["ic"]), len(sh["rc"])))
 
@@ -356,12 +368,14 @@ class GaussReader:
                 self._version = 2
             elif magic == MAGIC_V3:
                 self._version = 3
+            elif magic == MAGIC_V4:
+                self._version = 4
             else:
                 raise ValueError(
                     f"Unrecognised .gauss file magic: {magic!r}"
                 )
 
-            if self._version == 3:
+            if self._version >= 3:
                 n_comp, n_raw = struct.unpack("<II", f.read(8))
             else:
                 n_comp = struct.unpack("<I", f.read(4))[0]
@@ -380,23 +394,28 @@ class GaussReader:
                     sigma = _read_f64(f, K)
                     ic_words, rc_words = struct.unpack("<II", f.read(8))
                     shards = [dict(K=K, pi=pi, mu=mu, sigma=sigma,
-                                   ic_words=ic_words, rc_words=rc_words)]
+                                   ic_words=ic_words, rc_words=rc_words,
+                                   resid_scale=RESID_SCALE)]
                     shard_rows = 0
                 elif self._version == 2:
                     dtype_id = 0  # legacy: always float32
                     n_shards, shard_rows = struct.unpack("<HI", f.read(6))
-                    shards = _read_shards(f, n_shards)
-                else:  # v3
+                    shards = _read_shards(f, n_shards, read_resid_scale=False)
+                elif self._version == 3:
                     dtype_id = struct.unpack("<B", f.read(1))[0]
                     n_shards, shard_rows = struct.unpack("<HI", f.read(6))
-                    shards = _read_shards(f, n_shards)
+                    shards = _read_shards(f, n_shards, read_resid_scale=False)
+                else:  # v4
+                    dtype_id = struct.unpack("<B", f.read(1))[0]
+                    n_shards, shard_rows = struct.unpack("<HI", f.read(6))
+                    shards = _read_shards(f, n_shards, read_resid_scale=True)
 
                 self._index.append(dict(
                     key=key, shape=shape, dtype_id=dtype_id,
                     shard_rows=shard_rows, shards=shards,
                 ))
 
-            # Parse raw index (v3 only).
+            # Parse raw index (v3+ only).
             for _ in range(n_raw):
                 key = _read_name(f)
                 shape = _read_shape(f)
@@ -458,6 +477,8 @@ class GaussReader:
                 ).copy()
 
                 pi, mu, sigma = sh["pi"], sh["mu"], sh["sigma"]
+                # Use the scale stored in the shard (v4) or default (legacy).
+                s = sh.get("resid_scale", RESID_SCALE)
                 probs = (pi / pi.sum()).astype(np.float32)
                 model_cat = constriction.stream.model.Categorical(
                     probs, perfect=False
@@ -468,7 +489,7 @@ class GaussReader:
 
                 sigma_a = sigma[asgn]
                 means = np.zeros(N, np.float64)
-                stds = np.maximum(sigma_a * RESID_SCALE, 0.5)
+                stds = np.maximum(sigma_a * s, 0.5)
                 model_g = constriction.stream.model.QuantizedGaussian(
                     -RESID_BOUND, RESID_BOUND
                 )
@@ -476,7 +497,7 @@ class GaussReader:
                     model_g, means, stds
                 )
                 # Reconstruct in float64, then cast to original dtype.
-                out_chunks.append(mu[asgn] + resid_q / RESID_SCALE)
+                out_chunks.append(mu[asgn] + resid_q / s)
 
         flat = np.concatenate(out_chunks)
         target_np = _DTYPE_NUMPY[dtype_id]
@@ -532,14 +553,32 @@ def _read_f64(f, K: int) -> np.ndarray:
     return np.frombuffer(f.read(K * 8), np.float64).copy()
 
 
-def _read_shards(f, n_shards: int) -> list:
+def _read_shards(f, n_shards: int, read_resid_scale: bool = False) -> list:
+    """Read n_shards shard descriptors from the index section.
+
+    Parameters
+    ----------
+    f:                Open file positioned at the first shard descriptor.
+    n_shards:         Number of shards to read.
+    read_resid_scale: True for GAUSS004+ files which store a uint16
+                      resid_scale field after the GMM parameters.
+                      False for GAUSS001–003 (legacy); scale defaults to
+                      RESID_SCALE (1000).
+    """
+    from .codec import RESID_SCALE as _DEFAULT_SCALE
+
     shards = []
     for _ in range(n_shards):
         K = struct.unpack("<B", f.read(1))[0]
         pi = _read_f64(f, K)
         mu = _read_f64(f, K)
         sigma = _read_f64(f, K)
+        if read_resid_scale:
+            (resid_scale,) = struct.unpack("<H", f.read(2))
+        else:
+            resid_scale = _DEFAULT_SCALE
         ic_words, rc_words = struct.unpack("<II", f.read(8))
         shards.append(dict(K=K, pi=pi, mu=mu, sigma=sigma,
+                           resid_scale=resid_scale,
                            ic_words=ic_words, rc_words=rc_words))
     return shards

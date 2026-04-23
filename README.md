@@ -21,7 +21,7 @@ Gaussian Mixture Model (GMM) distribution fitting followed by Asymmetric Numeral
 | Feature | Detail |
 |---|---|
 | **Compression ratio** | ~4.9× on typical SFT checkpoints (K=16) |
-| **Max reconstruction error** | ±5×10⁻⁴ (mathematically bounded) |
+| **Max reconstruction error** | ±5×10⁻⁴ for fp32/fp16; ±3.9×10⁻³ for bf16 (adaptive-S) |
 | **Small / 1-D tensors** | Stored **losslessly** in raw section (not skipped) |
 | **Dtype preservation** | Original `float32 / float16 / bfloat16` restored exactly |
 | **Parallel** | Compression and decompression via `multiprocessing.Pool` |
@@ -175,19 +175,19 @@ state_dict = reader.decompress_all()        # {key: np.ndarray}
 
 ---
 
-## File Format (GAUSS003)
+## File Format (GAUSS004)
 
 The `.gauss` format stores metadata and data in separate sections, enabling random
 access to any individual tensor with a single seek:
 
 ```
-magic[8]           "GAUSS003"
+magic[8]           "GAUSS004"
 n_compressed[4]    uint32 — GMM-compressed layer count
 n_raw[4]           uint32 — raw lossless layer count
 
 === Compressed index section ===
   per layer: name, shape, dtype_id, n_shards, shard_rows,
-             per shard: K, pi, mu, sigma, idx_words, resid_words
+             per shard: K, pi, mu, sigma, resid_scale, idx_words, resid_words
 
 === Raw index section ===
   per layer: name, shape, dtype_id, raw_n_bytes
@@ -199,7 +199,12 @@ n_raw[4]           uint32 — raw lossless layer count
   per layer: little-endian tensor bytes
 ```
 
-Legacy `GAUSS001` and `GAUSS002` files are read-compatible (dtype defaults to float32).
+`resid_scale` (uint16, new in GAUSS004) records the effective quantization scale
+used per shard. For fp32 tensors this is always 1000; for bf16 it is automatically
+capped at 128 via adaptive-S (see [How It Works](#how-it-works)).
+
+Legacy `GAUSS001`–`GAUSS003` files are read-compatible (dtype defaults to float32,
+resid_scale defaults to 1000).
 
 ---
 
@@ -209,8 +214,9 @@ Legacy `GAUSS001` and `GAUSS002` files are read-compatible (dtype defaults to fl
 gauss/
 ├── __init__.py     # Public API: GaussWriter, GaussReader, compress_file, decompress_file
 ├── gmm.py          # Pure-NumPy hard EM: fit_gmm_fast, assign_all
-├── codec.py        # ANS wrappers (constriction): encode/decode indices & residuals
-├── format.py       # File I/O: GaussWriter, GaussReader (GAUSS001/002/003)
+├── codec.py        # ANS wrappers (constriction): encode/decode indices & residuals;
+│                   #   adaptive_resid_scale() for fp16/bf16 precision capping
+├── format.py       # File I/O: GaussWriter, GaussReader (GAUSS001–004)
 └── compress.py     # CLI entry point, multiprocessing workers
 ```
 
@@ -225,8 +231,16 @@ For each weight tensor `w`:
 2. **GMM Fitting** — fit a K-component mixture of Gaussians using hard EM (pure NumPy).
    Large tensors are subsampled to 200k elements for speed.
 3. **Assignment** — assign every weight to its most likely cluster.
-4. **Residual Quantization** — compute `r = round((w − μ_cluster) × 1000)`, clipped to
-   INT16 range. Reconstruction error is bounded by `±1/(2×1000) = ±5×10⁻⁴`.
+4. **Residual Quantization** — compute `r = round((w − μ_cluster) × S)`, clipped to
+   INT16 range. Reconstruction error is bounded by `±1/(2×S)`.
+   For reduced-precision dtypes, **adaptive-S** caps the scale at the dtype's
+   precision floor so sub-epsilon noise is never encoded into the bitstream:
+
+   | dtype | S (effective) | Max error |
+   |---|---|---|
+   | float32 | 1000 | ±5×10⁻⁴ |
+   | float16 | 1000 | ±5×10⁻⁴ |
+   | bfloat16 | **128** | ±3.9×10⁻³ |
 5. **ANS Encoding** — encode the assignment sequence with a Categorical model and the
    residuals with per-element QuantizedGaussian models, approaching the Shannon entropy
    bound.

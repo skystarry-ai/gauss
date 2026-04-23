@@ -73,12 +73,13 @@ def _worker_compress(task):
     from .codec import (
         RESID_BOUND,
         RESID_SCALE,
+        adaptive_resid_scale,
         encode_indices,
         encode_residuals,
     )
     from .gmm import fit_gmm_fast, assign_all
 
-    key, shard_idx, n_shards, data_np, K, max_iter, max_fit = task
+    key, shard_idx, n_shards, data_np, K, max_iter, max_fit, dtype_str = task
     try:
         data = data_np.astype(np.float64)
         N = len(data)
@@ -91,23 +92,28 @@ def _worker_compress(task):
         else:
             fit_data = data
 
+        # Clamp quantization scale to the precision floor of the source dtype.
+        # Encoding residuals finer than the dtype's ULP wastes bitstream space.
+        eff_scale = adaptive_resid_scale(dtype_str, RESID_SCALE)
+
         pi, mu, sigma, n_iter = fit_gmm_fast(fit_data, K, max_iter)
         asgn = assign_all(data, pi, mu, sigma)
         mu_a = mu[asgn]
         sigma_a = sigma[asgn]
         resid_q = np.clip(
-            np.round((data - mu_a) * RESID_SCALE).astype(np.int32),
+            np.round((data - mu_a) * eff_scale).astype(np.int32),
             -RESID_BOUND,
             RESID_BOUND,
         )
         ic = encode_indices(asgn, pi)
-        rc = encode_residuals(resid_q, sigma_a)
+        rc = encode_residuals(resid_q, sigma_a, scale=eff_scale)
         orig = N * 4
         comp = (len(ic) + len(rc)) * 4 + K * 3 * 8
         return {
             "key": key, "shard_idx": shard_idx, "n_shards": n_shards,
             "pi": pi, "mu": mu, "sigma": sigma,
             "ic": ic, "rc": rc, "K": K,
+            "eff_scale": eff_scale,
             "orig": orig, "comp": comp,
             "ratio": orig / comp, "n_iter": n_iter,
             "t": time.perf_counter() - t0,
@@ -193,6 +199,8 @@ def _worker_decompress(args):
             ).copy()
 
             pi, mu, sigma = sh["pi"], sh["mu"], sh["sigma"]
+            # Use the scale stored in the shard (v4) or default (legacy).
+            s = sh.get("resid_scale", RESID_SCALE)
             probs = (pi / pi.sum()).astype(np.float32)
             model_cat = constriction.stream.model.Categorical(
                 probs, perfect=False
@@ -202,14 +210,14 @@ def _worker_decompress(args):
             )
             sigma_a = sigma[asgn]
             means = np.zeros(N, np.float64)
-            stds = np.maximum(sigma_a * RESID_SCALE, 0.5)
+            stds = np.maximum(sigma_a * s, 0.5)
             model_g = constriction.stream.model.QuantizedGaussian(
                 -RESID_BOUND, RESID_BOUND
             )
             resid_q = constriction.stream.stack.AnsCoder(rc).decode(
                 model_g, means, stds
             )
-            out_chunks.append(mu[asgn] + resid_q / RESID_SCALE)
+            out_chunks.append(mu[asgn] + resid_q / s)
 
     np_dtype = _DTYPE_NUMPY[dtype_id]
     flat = np.concatenate(out_chunks).astype(np_dtype)
@@ -284,12 +292,15 @@ def compress_file(
     dtype_ids = {
         k: DTYPE_MAP.get(str(sd[k].dtype), 0) for k in compress_keys
     }
+    # Plain dtype name strings passed to adaptive_resid_scale (e.g. "float16").
+    dtype_strs = {k: str(sd[k].dtype).split(".")[-1] for k in compress_keys}
     layer_shard_info = {}  # key -> (n_shards, actual_shard_rows)
 
     for k in compress_keys:
         t = sd[k]
         flat = t.float().numpy().flatten()
         numel = t.numel()
+        dstr = dtype_strs[k]
 
         if numel > shard_threshold and t.ndim >= 2:
             n_rows = t.shape[0]
@@ -302,11 +313,11 @@ def compress_file(
                 end = min(start + actual_sr * row_size, numel)
                 tasks.append((
                     k, i, n_sh, flat[start:end],
-                    K, max_iter, max_fit_samples,
+                    K, max_iter, max_fit_samples, dstr,
                 ))
         else:
             layer_shard_info[k] = (1, 0)
-            tasks.append((k, 0, 1, flat, K, max_iter, max_fit_samples))
+            tasks.append((k, 0, 1, flat, K, max_iter, max_fit_samples, dstr))
 
     n_sharded = sum(1 for v in layer_shard_info.values() if v[0] > 1)
     print(
@@ -355,6 +366,9 @@ def compress_file(
                     {
                         "K": s["K"], "pi": s["pi"], "mu": s["mu"],
                         "sigma": s["sigma"], "ic": s["ic"], "rc": s["rc"],
+                        # Propagate the effective scale so GaussWriter can
+                        # record it in the GAUSS004 index section.
+                        "resid_scale": s["eff_scale"],
                     }
                     for s in shard_results
                 ],
@@ -578,6 +592,7 @@ def _cmd_info(file_path: str):
     """Print per-layer metadata without decompressing anything."""
     reader = GaussReader(file_path)
     size = Path(file_path).stat().st_size
+    from .codec import RESID_SCALE
     from .format import DTYPE_ID_MAP
 
     print(f"File:    {file_path}")
@@ -595,11 +610,13 @@ def _cmd_info(file_path: str):
         n_shards = len(e["shards"])
         shard_tag = f" [×{n_shards} shards]" if n_shards > 1 else ""
         K = e["shards"][0]["K"]
+        # resid_scale is uniform per layer in practice; show the first shard's.
+        s_eff = e["shards"][0].get("resid_scale", RESID_SCALE)
         dtype_str = DTYPE_ID_MAP.get(e["dtype_id"], "?")
         print(
             f"  {e['key']:<50}  {n * 4 // 1024:>6}KB → "
             f"{comp // 1024:>5}KB  {n * 4 / comp:.3f}x"
-            f"  K={K}  {dtype_str}{shard_tag}"
+            f"  K={K}  S={s_eff}  {dtype_str}{shard_tag}"
         )
 
     if reader._raw_index:
