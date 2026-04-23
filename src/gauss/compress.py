@@ -107,7 +107,7 @@ def _worker_compress(task: tuple) -> dict:
         )
         ic = encode_indices(asgn, pi)
         rc = encode_residuals(resid_q, sigma_a, scale=eff_scale)
-        orig = N * 4
+        orig = N * (2 if dtype_str in ("bfloat16", "float16") else 4)
         comp = (len(ic) + len(rc)) * 4 + K * 3 * 8
         return {
             "key": key, "shard_idx": shard_idx, "n_shards": n_shards,
@@ -618,9 +618,10 @@ def _cmd_info(file_path: str) -> None:
         # resid_scale is uniform per layer in practice; show the first shard's.
         s_eff = e["shards"][0].get("resid_scale", RESID_SCALE)
         dtype_str = DTYPE_ID_MAP.get(e["dtype_id"], "?")
+        bpe = 2 if dtype_str in ("bfloat16", "float16") else 4
         print(
-            f"  {e['key']:<50}  {n * 4 // 1024:>6}KB → "
-            f"{comp // 1024:>5}KB  {n * 4 / comp:.3f}x"
+            f"  {e['key']:<50}  {n * bpe // 1024:>6}KB → "
+            f"{comp // 1024:>5}KB  {n * bpe / comp:.3f}x"
             f"  K={K}  S={s_eff}  {dtype_str}{shard_tag}"
         )
 
