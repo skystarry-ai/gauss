@@ -278,7 +278,7 @@ vocab 32k):
   year        = {2026},
   month       = {4},
   institution = {Skystarry-AI},
-  doi         = {10.5281/zenodo.19676855},
+  doi         = {10.5281/zenodo.19676854},
 }
 ```
 
