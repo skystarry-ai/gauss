@@ -4,14 +4,40 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gauss-compress"
-version = "0.2.0"
-description = "Compress LLM weights using GMM + ANS"
+version = "0.1.0"
+description = "LLM weight compression via Gaussian Mixture Models + Asymmetric Numeral Systems (ANS) — 4.9× ratio, CPU-only"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [
-    { name = "민성 Skystarry", email = "vmintf@gmail.com" },
+    { name = "Minju Seok", email = "minsung@skystarry.xyz" },
 ]
 requires-python = ">=3.9"
+keywords = [
+    "llm",
+    "compression",
+    "gmm",
+    "gaussian-mixture-model",
+    "ans",
+    "asymmetric-numeral-systems",
+    "entropy-coding",
+    "model-compression",
+    "weight-compression",
+    "safetensors",
+    "checkpoint",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Archiving :: Compression",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "numpy",
     "torch",
@@ -20,12 +46,13 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/skystarry-ai/gauss"
 Repository = "https://github.com/skystarry-ai/gauss"
 "Bug Tracker" = "https://github.com/skystarry-ai/gauss/issues"
 
 [project.scripts]
-gauss = "gauss.gauss:main"
+gauss = "gauss.compress:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["gauss*"]
