@@ -2,6 +2,9 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
 title: "Gauss: LLM Checkpoint Compression"
+version: v0.1.0
+date-released: "2026-04-24"
+doi: 10.5281/zenodo.19718124
 authors:
   - family-names: Seok
     given-names: Minju
